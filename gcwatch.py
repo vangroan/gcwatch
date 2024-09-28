@@ -91,7 +91,6 @@ class _Monitor:
                 del self._metrics[ty]
 
     def sample(self) -> None:
-        logger.debug("Monitor: Sampling.")
         objects = iter(obj for obj in gc.get_objects() if isinstance(obj, self._types))
 
         with self._lock:
@@ -106,19 +105,17 @@ class _Monitor:
             for ty, count in counter.items():
                 self._metrics[ty].set_count(count)
 
-        logger.debug("Monitor: Sampling Done.")
-
     def run(self) -> None:
         logger.debug("Monitor: Starting up.")
 
         while not self._shutdown.is_set():
             self.sample()
-            logger.debug("Monitor: metrics=%s", self._metrics)
+            # logger.debug("Monitor: metrics=%s", self._metrics)
 
             if self._shutdown.is_set():
                 break
 
-            logger.debug("Monitor: Sleep %.3f", self._interval_seconds)
+            # logger.debug("Monitor: Sleep %.3f", self._interval_seconds)
             time.sleep(self._interval_seconds)
 
         logger.debug("Monitor: Shut down.")
@@ -129,7 +126,7 @@ class GcWatcher:
     # ------------
     # Config
     _types: tuple[type] = ()
-    _interval_ms = 250
+    _interval_ms: int
 
     # ------------
     # Shared State
@@ -157,6 +154,9 @@ class GcWatcher:
         self._shutdown = threading.Event()
         self._monitor = None
         self._on_sample = on_sample
+
+        if on_sample is not None:
+            raise NotImplementedError("TODO: Callback not implemented yet.")
 
     @property
     def is_running(self) -> bool:
@@ -225,7 +225,7 @@ class GcWatcher:
         self._monitor[0].start()
 
     def stop(self) -> None:
-        # Warning: Called from the finaliser. Don't rely on global state.
+        # Warning: Called from the finaliser. Avoid module-level state.
         self._assert_is_running()
 
         logger.debug("GcWatcher: Sending shutdown signal.")
@@ -268,7 +268,12 @@ for i in range(100):
 if __name__ == "__main__":
     logger.info("Start...")
 
-    with GcWatcher(track=Fubar, interval_ms=2000) as watch:
+    with GcWatcher(track=Fubar, interval_ms=25) as watch:
+        for _ in range(10):
+            time.sleep(0.5)
+            for i in range(1000):
+                Fubar().do_exp(i)
+        time.sleep(0.5)
         logger.info("Metrics: %s", watch.get_metrics())
 
     logger.info("Done...")
