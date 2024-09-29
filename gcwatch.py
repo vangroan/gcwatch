@@ -18,40 +18,46 @@ __all__ = [
     "GcWatcher",
 ]
 
+DataPoints = list[tuple[str, int, int, int]]
+"""Data point (type_name, count, maximum, delta)"""
+
+OnSampleHandler = Callable[[DataPoints], None]
+
 
 class Metric:
     __slots__ = (
-        "maximum",
-        "minimum",
         "count",
+        "maximum",
+        "delta",
     )
-    maximum: int
-    minimum: int
     count: int
+    maximum: int
+    delta: int
 
     def __init__(self) -> None:
         self.reset()
         self.maximum = 0
-        self.minimum = 0
+        self.delta = 0
 
     def set_count(self, count: int) -> None:
+        self.delta = count - self.count
         self.count = count
         self.maximum = max(self.maximum, count)
-        self.minimum = min(self.minimum, count)
 
     def reset(self) -> None:
         self.count = 0
 
     def __repr__(self) -> str:
-        return f"Metric(count={self.count}, maximum={self.maximum}, minimum={self.minimum})"
+        return f"Metric(count={self.count}, maximum={self.maximum}, delta={self.delta})"
 
 
 class _Monitor:
     _lock: threading.Lock
     _shutdown: threading.Event
-    _types: tuple[type]
+    _tracked_types: tuple[type]
     _metrics: Mapping[type, Metric]
     _interval_seconds: float
+    _on_sample_handler: OnSampleHandler | None
 
     def __init__(
         self,
@@ -60,43 +66,35 @@ class _Monitor:
         lock: threading.Lock,
         shutdown_signal: threading.Event,
         interval_ms: int,
+        on_sample: OnSampleHandler | None = None,
     ) -> None:
         logger.debug("Monitor: Tracking types %s", track_types)
 
         self._lock = lock
         self._shutdown = shutdown_signal
-        self._types = track_types
+        self._tracked_types = track_types
         self._metrics = defaultdict(Metric)
         self._interval_seconds = float(interval_ms) / 1000.0
+        self._on_sample_handler = on_sample
 
-    def track(self, types: type | tuple[type]) -> None:
-        logger.debug("Monitor: Tracking types %s", types)
-
-        if isinstance(types, type):
-            types = (types,)
-
+    def set_tracked_types(self, types: tuple[type]) -> None:
         with self._lock:
-            self._types = self._types + types
+            self._tracked_types = types
 
-    def untrack(self, types: type | tuple[type]) -> None:
-        logger.debug("Monitor: Untracking types %s", types)
-
-        if isinstance(types, type):
-            types = (types,)
-
-        with self._lock:
-            self._types = tuple(ty for ty in self._types if ty not in types)
-
-            for ty in types:
-                del self._metrics[ty]
+    def notify_callback(self) -> None:
+        if self._on_sample_handler is not None:
+            data_points = [
+                (_make_qualified_name(ty), metric.count, metric.maximum, metric.delta)
+                for ty, metric in self._metrics.items()
+            ]
+            self._on_sample_handler(data_points)
 
     def sample(self) -> None:
-        objects = iter(obj for obj in gc.get_objects() if isinstance(obj, self._types))
+        objects = iter(
+            obj for obj in gc.get_objects() if isinstance(obj, self._tracked_types)
+        )
 
         with self._lock:
-            for metric in self._metrics.values():
-                metric.reset()
-
             counter: dict[type, int] = defaultdict(lambda: 0)
 
             for obj in objects:
@@ -110,12 +108,11 @@ class _Monitor:
 
         while not self._shutdown.is_set():
             self.sample()
-            # logger.debug("Monitor: metrics=%s", self._metrics)
+            self.notify_callback()
 
             if self._shutdown.is_set():
                 break
 
-            # logger.debug("Monitor: Sleep %.3f", self._interval_seconds)
             time.sleep(self._interval_seconds)
 
         logger.debug("Monitor: Shut down.")
@@ -125,38 +122,35 @@ class GcWatcher:
 
     # ------------
     # Config
-    _types: tuple[type] = ()
     _interval_ms: int
+    _tracked_types: tuple[type] = ()
+    _on_sample_handler: OnSampleHandler | None
 
     # ------------
     # Shared State
     _lock: threading.Lock
     _shutdown: threading.Event
     _monitor: None | tuple[threading.Thread, _Monitor]
-    _on_sample: Callable | None
 
     def __init__(
         self,
         track: type | tuple[type] | None = None,
         interval_ms: int = 250,
-        on_sample: Callable | None = None,
+        on_sample: OnSampleHandler | None = None,
     ) -> None:
         if isinstance(track, tuple):
-            self._types = track
+            self._tracked_types = track
         elif isinstance(track, type):
-            self._types = (track,)
+            self._tracked_types = (track,)
         else:
-            self._types = ()
+            self._tracked_types = ()
 
         self._interval_ms = interval_ms
 
         self._lock = threading.Lock()
         self._shutdown = threading.Event()
         self._monitor = None
-        self._on_sample = on_sample
-
-        if on_sample is not None:
-            raise NotImplementedError("TODO: Callback not implemented yet.")
+        self._on_sample_handler = on_sample
 
     @property
     def is_running(self) -> bool:
@@ -170,14 +164,22 @@ class GcWatcher:
         """
         Track the given type in the garbage collector.
         """
-        # FIXME: Share _types with monitor
-        self._assert_is_running()
-        self._monitor[1].track(types)
+        if isinstance(types, type):
+            types = (types,)
+
+        self._tracked_types = self._tracked_types + types
+
+        if self.is_running:
+            self._monitor[1].set_tracked_types(copy(self._tracked_types))
 
     def untrack(self, types: type | tuple[type]) -> None:
-        # FIXME: Share _types with monitor
-        self._assert_is_running()
-        self._monitor[1].untrack(types)
+        if isinstance(types, type):
+            types = (types,)
+
+        self._tracked_types = tuple(ty for ty in self._tracked_types if ty not in types)
+
+        if self.is_running:
+            self._monitor[1].set_tracked_types(copy(self._tracked_types))
 
     def sample(self) -> None:
         self._assert_is_running()
@@ -209,14 +211,15 @@ class GcWatcher:
         self._shutdown.clear()
 
         monitor = _Monitor(
-            track_types=copy(self._types),
+            track_types=copy(self._tracked_types),
             lock=self._lock,
             shutdown_signal=self._shutdown,
             interval_ms=self._interval_ms,
+            on_sample=self._on_sample_handler,
         )
         # Seed the monitor's metrics with an immediate measurement
         # for the case where `get_metrics` is called before the
-        # first loop iteration.
+        # thread can do its first loop iteration.
         monitor.sample()
 
         worker = threading.Thread(target=monitor.run, daemon=False)
@@ -231,8 +234,11 @@ class GcWatcher:
         logger.debug("GcWatcher: Sending shutdown signal.")
 
         self._shutdown.set()
-        self._monitor[0].join(timeout=self._interval_ms * 1.5)
-        self._monitor = None
+
+        try:
+            self._monitor[0].join(timeout=self._interval_ms * 1.5)
+        finally:
+            self._monitor = None
 
     def __enter__(self) -> GcWatcher:
         self.start()
@@ -247,6 +253,7 @@ class GcWatcher:
         self.stop()
 
     def __del__(self) -> None:
+        # Warning: Called during VM shutdown. Don't rely on module-level state.
         if self.is_running:
             self.stop()
 
@@ -261,19 +268,19 @@ def _make_qualified_name(ty: type) -> str:
 logging.basicConfig(level="DEBUG")
 
 
-for i in range(100):
-    Fubar().do_exp(i)
-
-
 if __name__ == "__main__":
     logger.info("Start...")
 
-    with GcWatcher(track=Fubar, interval_ms=25) as watch:
-        for _ in range(10):
-            time.sleep(0.5)
-            for i in range(1000):
+    def on_sample(data_points: DataPoints):
+        logger.info("Sampled: %s", data_points)
+
+    with GcWatcher(track=Fubar, interval_ms=250, on_sample=on_sample) as watch:
+        for _ in range(3):
+            for i in range(100):
                 Fubar().do_exp(i)
-        time.sleep(0.5)
+                time.sleep(0.1)
+            Fubar.do_exp.cache_clear()
+            time.sleep(0.5)
         logger.info("Metrics: %s", watch.get_metrics())
 
     logger.info("Done...")
