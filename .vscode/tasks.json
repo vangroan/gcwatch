@@ -16,6 +16,18 @@
                 "cwd": "${workspaceFolder}"
             },
             "problemMatcher": []
-        }
+        },
+        {
+            "label": "isort (all)",
+            "type": "shell",
+            "command": "isort",
+            "args": [
+                "*.py"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        },
     ]
 }

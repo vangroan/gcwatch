@@ -15,7 +15,10 @@ from errors import WatcherAlreadyRunning, WatcherStopped
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "DataPoints",
     "GcWatcher",
+    "Metric",
+    "OnSampleHandler",
 ]
 
 DataPoints = list[tuple[str, int, int, int]]
@@ -77,9 +80,11 @@ class _Monitor:
         self._interval_seconds = float(interval_ms) / 1000.0
         self._on_sample_handler = on_sample
 
-    def set_tracked_types(self, types: tuple[type]) -> None:
+    def set_tracked_types(self, track_types: tuple[type]) -> None:
+        logger.debug("Monitor: Tracking types %s", track_types)
+
         with self._lock:
-            self._tracked_types = types
+            self._tracked_types = track_types
 
     def notify_callback(self) -> None:
         if self._on_sample_handler is not None:
