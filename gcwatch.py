@@ -57,7 +57,7 @@ class Metric:
 class _Monitor:
     _lock: threading.Lock
     _shutdown: threading.Event
-    _tracked_types: tuple[type]
+    _tracked_types: tuple[type, ...]
     _metrics: Mapping[type, Metric]
     _interval_seconds: float
     _on_sample_handler: OnSampleHandler | None
@@ -65,7 +65,7 @@ class _Monitor:
     def __init__(
         self,
         *,
-        track_types: tuple[type],
+        track_types: tuple[type, ...],
         lock: threading.Lock,
         shutdown_signal: threading.Event,
         interval_ms: int,
@@ -80,7 +80,7 @@ class _Monitor:
         self._interval_seconds = float(interval_ms) / 1000.0
         self._on_sample_handler = on_sample
 
-    def set_tracked_types(self, track_types: tuple[type]) -> None:
+    def set_tracked_types(self, track_types: tuple[type, ...]) -> None:
         logger.debug("Monitor: Tracking types %s", track_types)
 
         with self._lock:
@@ -128,7 +128,7 @@ class GcWatcher:
     # ------------
     # Config
     _interval_ms: int
-    _tracked_types: tuple[type] = ()
+    _tracked_types: tuple[type, ...] = ()
     _on_sample_handler: OnSampleHandler | None
 
     # ------------
@@ -139,7 +139,7 @@ class GcWatcher:
 
     def __init__(
         self,
-        track: type | tuple[type] | None = None,
+        track: type | tuple[type, ...] | None = None,
         interval_ms: int = 250,
         on_sample: OnSampleHandler | None = None,
     ) -> None:
@@ -161,6 +161,24 @@ class GcWatcher:
     def is_running(self) -> bool:
         return self._monitor is not None
 
+    @property
+    def _running_monitor(self) -> _Monitor | None:
+        """
+        The current Monitor instance, if the watcher is running.
+        """
+        if self._monitor is not None:
+            return self._monitor[1]
+        return None
+
+    @property
+    def _running_thread(self) -> threading.Thread | None:
+        """
+        The current Thread instance, if the watcher is running.
+        """
+        if self._monitor is not None:
+            return self._monitor[0]
+        return None
+
     def _assert_is_running(self) -> None:
         if not self.is_running:
             raise WatcherStopped
@@ -174,8 +192,8 @@ class GcWatcher:
 
         self._tracked_types = self._tracked_types + types
 
-        if self.is_running:
-            self._monitor[1].set_tracked_types(copy(self._tracked_types))
+        if monitor := self._running_monitor:
+            monitor.set_tracked_types(copy(self._tracked_types))
 
     def untrack(self, types: type | tuple[type]) -> None:
         if isinstance(types, type):
@@ -183,29 +201,35 @@ class GcWatcher:
 
         self._tracked_types = tuple(ty for ty in self._tracked_types if ty not in types)
 
-        if self.is_running:
-            self._monitor[1].set_tracked_types(copy(self._tracked_types))
+        if monitor := self._running_monitor:
+            monitor.set_tracked_types(copy(self._tracked_types))
 
     def sample(self) -> None:
-        self._assert_is_running()
-        self._monitor[1].sample()
+        monitor = self._running_monitor
+        if monitor is None:
+            raise WatcherStopped()
+        monitor.sample()
 
     def get_counts(self) -> dict[str, int]:
-        self._assert_is_running()
-
         with self._lock:
+            monitor = self._running_monitor
+            if monitor is None:
+                raise WatcherStopped
+
             return {
                 _make_qualified_name(ty): metric.count
-                for ty, metric in self._monitor[1]._metrics.items()
+                for ty, metric in monitor._metrics.items()
             }
 
     def get_metrics(self, threshold: int = 10) -> dict[str, Metric]:
-        self._assert_is_running()
-
         with self._lock:
+            monitor = self._running_monitor
+            if monitor is None:
+                raise WatcherStopped
+
             return {
                 _make_qualified_name(ty): deepcopy(metric)
-                for ty, metric in self._monitor[1]._metrics.items()
+                for ty, metric in monitor._metrics.items()
                 if metric.count >= threshold
             }
 
@@ -234,14 +258,16 @@ class GcWatcher:
 
     def stop(self) -> None:
         # Warning: Called from the finaliser. Avoid module-level state.
-        self._assert_is_running()
+        thread = self._running_thread
+        if thread is None:
+            raise WatcherStopped
 
         logger.debug("GcWatcher: Sending shutdown signal.")
 
         self._shutdown.set()
 
         try:
-            self._monitor[0].join(timeout=self._interval_ms * 1.5)
+            thread.join(timeout=self._interval_ms * 1.5)
         finally:
             self._monitor = None
 
@@ -270,16 +296,16 @@ def _make_qualified_name(ty: type) -> str:
 
 # ---------------------------------
 
-logging.basicConfig(level="DEBUG")
-
 
 if __name__ == "__main__":
+    logging.basicConfig(level="DEBUG")
+
     logger.info("Start...")
 
     def on_sample(data_points: DataPoints):
         logger.info("Sampled: %s", data_points)
 
-    with GcWatcher(track=Fubar, interval_ms=250, on_sample=on_sample) as watch:
+    with GcWatcher(track=(Fubar,), interval_ms=250, on_sample=on_sample) as watch:
         for _ in range(3):
             for i in range(100):
                 Fubar().do_exp(i)
